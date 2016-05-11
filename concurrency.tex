@@ -1,0 +1,1683 @@
+\documentclass[8pt]{beamer}
+
+\usetheme{Warsaw}
+
+\usepackage[polish]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[OT4]{fontenc}
+\usepackage{listings}
+\usepackage{tikzsymbols}
+
+\lstset{
+  language=C++,
+  basicstyle=\tiny
+}
+
+\title{Boost.Asio: synchroniczne i asynchroniczne programowanie serwisów sieciowych w C++}
+
+\author{Wojciech~Wiśniewski\inst{1}}
+
+\institute
+{
+  \inst{1} Mobica
+}
+
+\date{Luty 2016}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+\end{frame}
+
+\begin{frame}{Program prezentacji}
+  \tableofcontents
+\end{frame}
+
+\section{Wprowadzenie}
+
+\begin{frame}{Co to jest Boost.Asio?}
+  \alert{Asio} (\alert{As}ynchronous \alert{i}nput-\alert{o}utput) jest biblioteką służącą
+  do pisania przenośnych i wydajnych programów, które muszą współbieżnie reagować na zdarzenia
+  pochodzące z wielu źródeł:
+  \begin{itemize}
+    \item gniazdek sieciowych (sockets)
+    \item zegarów (timers)
+    \item sygnałów
+    \item portów szeregowych
+  \end{itemize}
+
+  (typowy przypadek: serwis sieciowy obsługujący wielu klientów równocześnie)
+  
+  Obsługuje zarówno synchroniczny, jak i asynchroniczny styl programowania.
+\end{frame}
+
+\begin{frame}{Synchroniczna i asynchroniczna obsługa wejścia/wyjścia: definicje}
+  Synchronicznośc i asynchroniczność dotyczą sposobu obsługi (potencjalnie) długo
+  trwających zadań wykonywanych przez urządzenia zewnętrzne (wejścia/wyjścia, np. oczekiwania
+  na dane z sieci).
+
+  \begin{block}{Obsługa synchroniczna}
+    W podejściu \alert{synchroniznym} program inicjuje operację wejścia/wyjścia, a następnie
+    zostaje \alert{zablokowany} do czasu jej zakończenia (oddaje sterowanie do systemu
+    operacyjnego, zostaje ,,uśpiony''). Obsługę wielu operacji jednocześnie uzyskujemy poprzez
+    użycie wielu programów lub wątków.
+  \end{block}
+
+  \begin{block}{Obsługa asynchroniczna}
+    W podejściu \alert{asynchronicznym} program inicjuje (w sposób \alert{nieblokujący}) operację
+    wejścia/wyjścia, a następnie może być powiadamiany (w sposób \alert{blokujący}) o jej statusie.
+    Obsługę wielu operacji jednocześnie uzyskujemy inicjując wiele operacji bez czekania na ich
+    zakończenie.
+  \end{block}
+\end{frame}
+
+\begin{frame}{Synchroniczna i asynchroniczna obsługa wejścia/wyjścia: systemy operacyjne}
+%  \begin{block}
+    API do obsługi synchronicznego wejścia-wyjścia w głównych systemach operacyjnych jest podobne
+    (\texttt{read}/\texttt{write}, \texttt{recv}/\texttt{send}).
+%  \end{block}
+
+%  \begin{block}
+    API do obsługi asynchronicznej mocno różnią się między systemami:
+    \begin{itemize}
+    \item Linux -- \texttt{epoll}
+    \item *BSD, MacOS X -- \texttt{kqueue}
+    \item Windows -- overlapped I/O, completion ports
+    \end{itemize}
+%  \end{block}
+
+%  \begin{block}
+    Boost.Asio tworzy niezależną od sytemu warstwę abstrakcji ponad tymi niskopoziomowymi
+    API i ustanawia model programowania asynchronicznego, w którym rejestrujemy funkcje (lub inne
+    wywoływalne obiekty), które będą wywołane, gdy zainicjowana operacja się zakończy.
+%  \end{block}
+\end{frame}
+
+\begin{frame}{Nasz przykład}
+  Napiszemy ten sam prosty program (serwer czatu) w trzech różnych stylach:
+  \begin{itemize}
+    \item synchronicznym wielowątkowym
+    \item asynchronicznym z użyciem callbacków
+    \item asynchronicznym z użyciem wątków kooperatywnych
+  \end{itemize}
+  i porównamy wydajność, łatowść pisania oraz podatność na modyfikacje programów napisanch
+  w powyższych stylach.
+\end{frame}
+
+\begin{frame}{Specyfikacja serwera czatu}
+  \begin{itemize}
+    \item Serwer nasłuchuje na porcie TCP podanym z linii poleceń.
+    \item Programem klienckim będzie \texttt{netcat}.
+    \item Po połączeniu serwer pyta klienta nick. Serwer dba o unikalność nicków
+          zalogowancych w danej chwili klientów, pytanie o nick będzie powtarzane dopóki
+          klient nie poda unikalnego nicka.
+    \item Zalogowani klienci dostają (na zasadzie jeden-do-wszystkich) komunikaty
+          o zdarzeniach: logowania i rozłączenia innych klientów oraz wpisywane przez nich
+          linijki tekstu.
+    \item Specjalne komendy dostępne dla klientów:
+          \begin{itemize}
+            \item \texttt{/quit} powoduje rozłączenie klienta
+            \item \texttt{/shutdown} powoduje zamknięcie całego serwera
+          \end{itemize}
+    \item Serwer powinien obsłużyć niepowodzenie dowolnej operacji sieciowej.
+    \item Serwer powinien być wolny od wyścigów i niepoprawnego użycia pamięci (sprawdzane przy
+          pomocy \texttt{valgrind}a).
+  \end{itemize}
+\end{frame}
+
+\section{Serwer czatu: wersja synchroniczna wielowątkowa}
+
+\begin{frame}{Klasy}
+  Dwie klasy: \texttt{ChatServer} i \texttt{ClientSession}
+\end{frame}
+
+\begin{frame}[fragile]{\texttt{ChatServer}: interfejs pulibczny}
+  \begin{lstlisting}
+    class ChatServer {
+      public:
+      // interfejs dla programu glownego
+
+      ChatServer(int port);
+      ~ChatServer();
+
+      // Petla glowna
+      void run();
+
+      // interfejs dla klasy ClientSession
+
+      // Sprawdz, czy nick jest juz zarejestrowany, jesli nie, to zarejestruj go i ustaw w kliencie.
+      // Zwraca true w przypadku sukcesu i false w przypadku porazki.
+      bool setClientName(const std::shared_ptr<ClientSession>& client, const std::string &name);
+
+      // Rozeslij wiadomosc do wszystkich klientow
+      void broadcast(ClientSession& sender, const std::shared_ptr<std::string>& msg);
+
+      // Usun klienta z listy zarejestrowanych klientow
+      void removeClient(std::shared_ptr<ClientSession>&& client);
+
+      // Zamknij serwer (zakoncz petle glowna)
+      void shutdown();
+    };
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{\texttt{ClientSession}: interfejs publiczny (dla klasy \texttt{ChatServer})}
+  \begin{lstlisting}
+    class ClientSession : public std::enable_shared_from_this<ClientSession> {
+    public:
+      ClientSession(ChatServer& server, boost::asio::io_service &ioService);
+
+      boost::asio::ip::tcp::socket& socket() {
+        return _socket;
+      }
+
+      // Pobiez nicka (jesli ustawiony)
+      const std::string* getName() const {
+        return _nameValid ? &_name : nullptr;
+      }
+
+      // Ustaw nicka
+      void setName(const std::string &name) {
+        assert(! _nameValid);
+        _name = name;
+        _nameValid = true;
+      }
+
+      // Rozpocznij dialog z klientem
+      void start();
+
+      // Wyslij wiadomosc do klienta
+      void sendMessage(const std::shared_ptr<std::string>& msg);
+
+      // Zakoncz dialog z klientem
+      void terminate();
+
+    private:
+      ChatServer& _server;
+      boost::asio::ip::tcp::socket _socket;
+      std::string _name;
+      bool _nameValid;
+    };
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{std::enable\_shared\_from\_this}}
+  Dziedziczenie po \texttt{std::enable\_shared\_from\_this} umożliwia pobieranie sprytnych
+  wskaźników do instancji tej klasy wewnątrz jej metod (klasa dostarcza metodę
+  \texttt{shared\_from\_this}).
+
+  Zastosowana przez \texttt{enable\_shared\_from\_this} technika dodawania funkcjonalności do klas
+  poprzez dziedziczenie z szablonowej klasy bazowej sparametryzowanej przez klasę pochodną nazywa
+  się ,,curiously recurring template pattern''.
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::io\_service}}
+  \texttt{io\_service} to klasa zarządzająca operacjami i obiektami wejścia/wyjścia.
+  W wersji asynchronicznej dostarcza pętlę główną (\texttt{io\_service::run()}), której
+  w tej wersji nie będziemy używać.
+
+  Wszystkie obiekty wejścia/wyjścia w Asio (gniazdka, zegary, itd.) dziedziczą po
+  \texttt{basic\_io\_object} i rejestrują się \texttt{io\_service} podczas konstrukcji.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatService::run}}
+  \begin{lstlisting}
+    class ChatServer {
+    public:
+      ChatServer(int port);
+    private:
+      boost::asio::ip::tcp::acceptor _acceptor;
+      std::mutex _clientsMutex;
+      std::set<std::shared_ptr<ClientSession> > _clients;
+      pthread_t _acceptingThreadId;
+      std::atomic<bool> _isTerminating;
+    };
+
+    ChatServer::ChatServer(int port) :
+    _acceptor(_ioService, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), port)),
+    _isTerminating(false) { }
+
+    void ChatServer::run() {
+      _acceptingThreadId = pthread_self();
+      while (! _isTerminating) {
+        std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+        _acceptor.accept(client->socket());
+        std::lock_guard<std::mutex> guard(_clientsMutex);
+        if (! _isTerminating) {
+          auto p = _clients.insert(client);
+          assert(p.second);
+          client->start();
+        }
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::ip::tcp::acceptor}}
+  \texttt{acceptor} służy do przyjmowania nowych połączeń (wrapper na funkcje systemowe
+  \texttt{bind}, \texttt{listen} i \texttt{accept}).
+
+  Konstruktor (oprócz \texttt{io\_service}), przyjmuje obiekt typu \texttt{endpoint},
+  reprezentujący specyfikację nasłuchiwania -- trójkę: protokół, adres (u nas pusty: słuchamy
+  na wszystkich interface'ach), port.
+
+  Metoda \texttt{acceptor::accept} w blokujący sposób oczekuje na nowe przychodzące połączenie
+  i umieszcza je w przekazanym \texttt{socket}'cie.
+\end{frame}
+
+\begin{frame}{\texttt{std::mutex}}
+  \texttt{mutex} to podstawowy sposób wykluczania wzajemnego między wątkami.
+
+  Standard C++11 oferuje cztery rodzaje mutexów: \texttt{mutex}, \texttt{recursive\_mutex},
+  \texttt{timed\_mutex} i  \texttt{recursive\_timed\_mutex}. Wszystkie mutexy obsługują operacje
+  \texttt{lock}, \texttt{try\_lock} i \texttt{unlock}. Warianty \texttt{timed} obsługują dodatkowo
+  próby blokowania z limitem czasu: \texttt{try\_lock\_for} i \texttt{try\_lock\_until}. Wersje
+  \texttt{recursive} umożliwiają wielokrotne blokowanie przez ten sam wątek.
+
+  Używanie rekursywnych mutexów jest niezalecane przez niektóre poradniki dobrego
+  stylu programowania.
+\end{frame}
+
+\begin{frame}{\texttt{std::lock\_guard}}
+  \texttt{lock\_guard} umożliwia zarządzanie blokowaniem mutexów poprzez RAII 
+  (Resource Acquisition Is Initialization): podczas konstrukcji blokuje mutex,
+  przy destrukcji go zwalnia.
+\end{frame}
+
+\begin{frame}{\texttt{std::make\_shared}}
+  Funkcja \texttt{make\_shared<T>} alokuje przy pomocy jednego wywołania \texttt{new} miejsce na
+  obiekt klasy \texttt{T} i obiekt licznik odwołań dla \texttt{shared\_ptr}. Następnie wywołuje
+  konstruktor klasy \texttt{T} z podanymi argumentami.
+
+  Jest to przykład tzw. ,,perfect forwarding''.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::start}}
+  \begin{lstlisting}
+    class ClientSession {
+    private:
+      void readerThread();
+      void writerThread();
+
+      std::thread _readerThread;
+      std::thread _writerThread;
+    };
+
+    void ClientSession::start() {
+      _readerThread = std::thread(std::bind(&ClientSession::readerThread, this));
+      _writerThread = std::thread(std::bind(&ClientSession::writerThread, this));
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{std::thread}}
+  \texttt{thread} reprezentuje wątek. Konstruktor pobiera dowolny wywoływalny obiekt
+  o sygnaturze \texttt{void ()}. Wątek startuje od razu w momencie konstrukcji
+  (nie ma metody \texttt{start}).
+\end{frame}
+
+\begin{frame}{\texttt{std::bind}}
+  \texttt{bind} pozwala nam ,,ustalić'' niektóre (lub wszystkie) argumenty obiektu
+  wywoływalnego i zwrócić nowy wywoływalny obiekt o sygnaturze z usuniętymi ,,ustalonymi''
+  argumentami.
+
+  \texttt{bind} jako argumenty przyjmuje obiekt wywoływalny i takie argumenty, jakie przyjmowałoby
+  jego wywołanie, albo specjalne obiekty \texttt{\_1}, \texttt{\_2}, itd., żyjące w namespace
+  \texttt{std::placeholders}. Specjalne obiekty placeholders specyfikują, jak będzie wyglądało
+  wywołanie nowego obiektu funkcyjnego.
+
+  W naszym przypadku obiektem wywoływalnym jest wskaźnik do bezargumentowej metody
+  klasy \texttt{ClientSession}. Wywołanie takiego obiektu potrzebuje jednego argumentu: wskaźnika
+  lub refererencji do obiektu \texttt{ClientSession}. \texttt{bind} zaspokaja więc wszystkie
+  argumenty obiektu wywoływalnego i powstaje nowy obiekt o sygnaturze \texttt{void ()} -- takiej,
+  jakiej potrzebuje konstruktor \texttt{thread}.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::readerThread}}
+  \begin{lstlisting}
+    class ClientSession {
+    private:
+      enum {
+        ALL_RUNNING = 0,
+        READER_TERMINATED = 1,
+        WRITER_TERMINATED = 2,
+        READER_TERMINATION_REQUESTED = 4
+      };
+
+      std::string readLineFromClient();
+      bool parseLine(const std::string& line);
+      void onReaderShutdown();
+
+      std::atomic<int> _state;
+    };
+
+    ClientSession::ClientSession(ChatServer& server, boost::asio::io_service &ioService) :
+    _state(ALL_RUNNING) { }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::readerThread} ciąg dalszy}
+  \begin{lstlisting}
+    void ClientSession::readerThread() {
+      try {
+        bool loginSuccessfull = false;
+        while (! loginSuccessfull && _state == ALL_RUNNING) {
+          boost::asio::write(_socket, boost::asio::buffer("What's your name?\n"));
+          std::string name = readLineFromClient();
+          if ((loginSuccessfull = _server.setClientName(shared_from_this(), name))) {
+            std::string response = "Welcome to the chat, " + name + "!\n";
+            boost::asio::write(_socket, boost::asio::buffer(response));
+          }
+          else {
+            std::string response = "Name '" + name + "' is already taken, invent another one.\n";
+            boost::asio::write(_socket, boost::asio::buffer(response));
+          }
+        }
+
+        while (parseLine(readLineFromClient()));
+      }
+      catch (std::exception& ex) {
+        const std::string *name = getName();
+        std::string formattedName = name ? "'" + *name + "'" : "(null)";
+        std::cout << "Client " << formattedName << " reader thread exeption: " << ex.what() << std::endl;
+      }
+
+      onReaderShutdown();
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::write}}
+  \texttt{write} to przeciążona funkcja szablonowa. Tutaj używamy ją z minimalną
+  liczbą argumentów. Pierwszym argumentem jest obiekt zapisywalny (implementujący metodę
+  \texttt{write\_some}), drugim jest bufor wyjściowy (koncept \texttt{ConstBufferSequence} --
+  coś z czego można wyciągnąć listę obszarów pamięci zawierających dane do zapisania).
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::buffer}}
+  \texttt{buffer} to przeciążona funkcja szablonowa, przekształcająca różne obiekty
+  (zwykła tablica, \texttt{std::array}, \texttt{boost::array}, wskaźnik + rozmiar,
+  \texttt{std::string}, itd.) w obiekty odpowiadające konceptowi \texttt{MutableBufferSequence}
+  lub \texttt{ConstBufferSequence}.
+\end{frame}
+
+\begin{frame}{\texttt{std::atomic}}
+  Obiekty typu \texttt{atomic<T>} w większości wypadków zachowują się jak zwykłe zmienne typu
+  \texttt{T}:  mają konwersję niejawną konwersję na \texttt{T} (wołającą
+  \texttt{atomic<T>::load())}) i operator przypisania biorący T jako argument (wołający
+  \texttt{atomic<T>::store(T)}).
+
+  Używając obiektów \texttt{atomic} mamy pewność, że w przypadku, gdy jeden wątek ustawia zapisuje
+  daną zamienną, a inny ją odczytuje, wątek czytający zawsze odczyta aktualną wartość. Nie jest
+  to zagwarantowane w przypadku zwykłych wartości (nawet typów prostych).
+\end{frame}
+
+\begin{frame}{Obsługa błędów}
+  Ponieważ sterowanie przepływa ,,wprost'' (stan programu jest odzwierciedlony przez stos), możemy
+  sygnalizować błędy za pomocą wyjątków i łapać je w jednym miejscu. Wyjątki nie powinny opuszczać
+  głównej funkcji wątku (spowoduje to wywołanie \texttt{std::terminate()} i zakończenie programu.
+
+  Wszystkie operacje blokujące (widzieliśmy już \texttt{boost::asio::accept}
+  i \texttt{boost::asio::write}) rzucają wyjątki typu \texttt{boost::system::system\_error},
+  dziedziczące po \texttt{std::exception}.
+
+  Jeśli obsługa błędów poprzez wyjątki nam nie odpowiada, każda operacja blokująca ma wariant
+  z dodatkowym parametrem wyjściowym typu \texttt{boost::system::error\_code}, który można
+  przetestować na okoliczność błędu. Zobaczymy to w wersji asynchronicznej.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::readLineFromClient}}
+  \begin{lstlisting}
+    class ClientSession {
+    private:
+      boost::asio::streambuf _inputBuffer;
+    };
+
+    std::string ClientSession::readLineFromClient() {
+      boost::asio::read_until(_socket, _inputBuffer, '\n');
+      std::istream stream(&_inputBuffer);
+      std::string line;
+      std::getline(stream, line);
+      return line;
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::streambuf}}
+  \texttt{boost::asio::steambuf} to rozszerzalny bufor dziedziczący z \texttt{std::streambuf}.
+  Jak widzimy, można z niego w łatwy sposób wyciągać dane po linijce.
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::read\_until}}
+  \texttt{read\_until} jest operacją blokującą (przeciążoną funkcją szablonową), która czyta,
+  dopóki dane znajdujące się w buforze nie spełniają określonego warunku.
+
+  Pierwszym argumentem jest obiekt odczytywalny, czyli posiadający metodę \texttt{read\_some}.
+
+  Drugim argumentem jest \texttt{boost::asio::streambuf}.
+
+  Trzecim argumentem jest warunek końca. W naszym przypadku czytamy, aż w buforze nie znajdzie
+  się co najmniej jeden znak końca linii, ale można też czekać na określony napis
+  (\texttt{std::string}), aż dane spełnią zadane wyrażenie regularne (\texttt{boost::regex})
+  lub dowolny warunek, sprawdzany przy pomocy obiektu wywoływalnego.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::parseLine}}
+
+  Ta metoda jest identyczna we wszystkich implementacjach. Używam biblioteki Boost.DateTime,
+  a nie \texttt{std::chrono::time\_point}, ponieważ nie znalazłem prostego sposobu zamiany
+  \texttt{std::chrono::time\_point} na tekst \Sadey.
+
+  \begin{lstlisting}
+    bool ClientSession::parseLine(const std::string& line) {
+      if (line == "/quit") {
+        return false;
+      }
+      else if (line == "/shutdown") {
+        _server.shutdown();
+        return false;
+      }
+      else {
+        std::ostringstream stream;
+        stream << boost::posix_time::microsec_clock::local_time() << ' '
+               << _name << ": " << line << std::endl;
+        _server.broadcast(*this, std::make_shared<std::string>(stream.str()));
+        return true;
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::setClientName}}
+  \begin{lstlisting}
+    template <class T>
+    struct PtrLess {
+      bool operator()(const T *lhs, const T *rhs) const {
+        if (lhs == nullptr) {
+          return rhs != nullptr;
+        }
+        else if (rhs == nullptr) {
+          return false;
+        }
+        else {
+          return *lhs < *rhs;
+        }
+      }
+    };
+
+    class ChatServer {
+    private:
+      typedef std::map<const std::string*, std::shared_ptr<ClientSession>,
+                       PtrLess<std::string> > NamesToClientsMap;
+
+      std::mutex _namesToClientsMutex;
+      NamesToClientsMap  _namesToClients;
+    }
+
+    bool ChatServer::setClientName(const std::shared_ptr<ClientSession>& client,
+                                   const std::string &name) {
+      std::lock_guard<std::mutex> guard(_namesToClientsMutex);
+      NamesToClientsMap::iterator found = _namesToClients.find(&name);
+      if (found == _namesToClients.end()) {
+        client->setName(name);
+        auto res = _namesToClients.insert(std::make_pair(client->getName(), client));
+        assert(res.second);
+        return true;
+      }
+      else {
+        return false;
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::broadcast}}
+  Jedyną ciekawostką jest tu, że wykopiowujemy listę zalogowanych klientów z mapy, aby krócej
+  blokować mutex.
+
+  \begin{lstlisting}
+    void ChatServer::broadcast(ClientSession& sender,
+                               const std::shared_ptr<std::string>& msg) {
+      std::vector<std::shared_ptr<ClientSession> > clients;
+      {
+        std::lock_guard<std::mutex> guard(_namesToClientsMutex);
+        clients.reserve(_namesToClients.size());
+        for (const auto& kvPair : _namesToClients) {
+          clients.push_back(kvPair.second);
+        }
+      }
+      for (const auto& receiver : clients) {
+        if (receiver.get() != &sender) {
+          receiver->sendMessage(msg);
+        }
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::sendMessage}}
+  \begin{lstlisting}
+    class ClientSession {
+    private:
+      std::mutex _messagesMutex;
+      std::deque<std::shared_ptr<std::string> > _messages;
+      std::condition_variable _writerCondition;
+    };
+
+    void ClientSession::sendMessage(const std::shared_ptr<std::string>& msg) {
+      std::lock_guard<std::mutex> guard(_messagesMutex);
+      _messages.push_back(msg);
+      _writerCondition.notify_one();
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{std::condition\_variable}: powiadamiane}
+  \texttt{condition\_variable} to ,,urządzenie'', które usypia wątek, dopóki nie zostanie
+  spełniony zadany warunek. Tutaj widzimy funkcjonalność budzenia. Na jednej 
+  \texttt{condition\_variable} może spać wiele wątków, metoda \texttt{notify\_one} budzi tylko
+  jeden z nich, \texttt{notify\_all} -- wszystkie.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::writerThread}}
+  \begin{lstlisting}
+    class ClientSession {
+    private:
+      std::shared_ptr<std::string> getMessage();
+
+      void onWriterShutdown();
+
+    };
+
+    void ClientSession::writerThread() {
+      try {
+        bool run = true;
+        while (run) {
+          auto msg = getMessage();
+          if (msg) {
+            boost::asio::write(_socket, boost::asio::buffer(*msg));
+          }
+          else {
+            run = false;
+          }
+        }
+      }
+      catch (std::exception& ex) {
+        const std::string *name = getName();
+        std::string formattedName = name ? "'" + *name + "'" : "(null)";
+        std::cout << "Client " << formattedName << " writer thread exeption: " << ex.what() << std::endl;
+      }
+
+      onWriterShutdown();
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::getMessage}}
+  \begin{lstlisting}
+    std::shared_ptr<std::string> ClientSession::getMessage() {
+      std::unique_lock<std::mutex> lock(_messagesMutex);
+      _writerCondition.wait(lock, [this]() { return _state != ALL_RUNNING || ! _messages.empty(); });
+      if (_state != ALL_RUNNING) {
+        return std::shared_ptr<std::string>();
+      }
+      else {
+        auto msg = _messages.front();
+        _messages.pop_front();
+        return msg;
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{std::unique\_lock}}
+  \texttt{unique\_lock} jest podobny do \texttt{lock\_guard}. Różnicą jest to, że można używać go
+  do wielokrotnego zamykania/zwalniania mutexu bez konstrukcji i destrukcji. \texttt{unique\_lock}
+  pamięta swój stan i podczas destrukcji zwolni mutex tylko jeśli będzie potrzeba. Można go
+  też stworzyć w stanie niezablokowanym.
+\end{frame}
+
+\begin{frame}{\texttt{std::condition\_variable}: czekanie}
+  Semantyka metody \texttt{wait}:
+  \begin{enumerate}
+  \item Blokujemy mutex broniący dostępu do danych, na których będziemy przeprowadzać test
+    przy pomocy \texttt{unique\_lock}
+  \item Do metody \texttt{wait} przekazujemy jako argumenty ten \texttt{unique\_lock} i obiekt
+    wywoływanly, który powinien zwrócić \texttt{true}, gdy oczekiwany warunek jest spełniony
+  \item \texttt{wait} sprawdza warunek, jeśli jest spełniony, wychodzi, jeśli nie, zwalnia mutex
+    i usypia, czekając aż będie zawołane \texttt{notify\_one}  lub \texttt{notify\_all}.
+  \item Po obudzeniu, mutex jest ponownie blokowany i wracamy do punktu 3
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Kończenie wątków}
+  W każdej chwili wątek czytający, jak i wątek piszący mogą zostać przerwane (np. na skutek wyjątku).
+  Wątek kończący się wcześniej powinien spowodować przerwanie drugiego wątku, a drugi powinien
+  poprosić serwer o derejestrację i usunięcie klienta. Odpowidzialne za to są metody
+  \texttt{ClientSession::onReaderShutdown} i \texttt{ClientSession::onWriterShutdown}.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::onReaderShutdown} i \texttt{ClientSession::onWriterShutdown}}
+  \begin{lstlisting}
+    class ClientSession {
+      private:
+      void interruptReader();
+    };
+
+    void ClientSession::onReaderShutdown() {
+      int oldValue = _state.fetch_or(READER_TERMINATED);
+      if (oldValue & WRITER_TERMINATED) {
+        _server.removeClient(shared_from_this());
+      }
+      else {
+        _writerCondition.notify_one();
+      }
+    }
+
+    void ClientSession::onWriterShutdown() {
+      int oldValue = _state.fetch_or(WRITER_TERMINATED);
+      if (oldValue & READER_TERMINATED) {
+        _server.removeClient(shared_from_this());
+      }
+      else {
+        interruptReader();
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{\texttt{std::atomic::fetch\_or}}
+  Operacja \texttt{fetch\_or} jest równoznaczna z atomowym
+  (nieprzerywalnym) wykonaniem takiego pseudokodu:
+
+  \begin{lstlisting}
+    template <class T>
+    class atomic {
+    private:
+      T _value;
+      
+    public:
+      T fetch_or(T mask) {
+        T oldValue = _value;
+        _value |= mask;
+        return oldValue;
+      }
+    };
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{Przerywanie operacji blokujących}
+  Żeby zakończyć wątek czytelnika, musimy przerwać blokującą oprację \texttt{read\_until}. Nestety,
+  Boost.Asio nie zawiera API do przerywania operacji blokujących z innego wątku. Aby
+  to zrobić na Linuxie musimy użyć niskopoziomowego API sygnałów. Tak więc nasz program nie będzie
+  działał pod Windows \Sadey.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::interruptReader} (i przy okazji \texttt{main})}
+  \begin{lstlisting}
+    static void handler(int) { }
+
+    int main(int argc, char **argv) {
+      struct sigaction action;
+      memset(&action, 0, sizeof(action));
+      action.sa_handler = handler;
+      if (sigaction(SIGUSR1, &action, nullptr) != 0) {
+        perror("sigaction");
+        return 1;
+      }
+
+      try {
+        if (argc < 2) {
+          std::cerr << "Usage: " << argv[0] << " <port>\n";
+          return 1;
+        }
+        ChatServer server(boost::lexical_cast<int>(argv[1]));
+        server.run();
+        return 0;
+      }
+      catch (std::exception &ex) {
+        std::cerr << "Main thread exception: " << ex.what() << std::endl;
+        return 1;
+      }
+    }
+
+    void ClientSession::interruptReader() {
+      _state.fetch_or(READER_TERMINATION_REQUESTED);
+      pthread_kill(_readerThread.native_handle(), SIGUSR1);
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{Przerywanie operacji blokujących przez sygnały}
+  Witajcie w latach '80! Oto przepis na przerywanie operacji
+  blokujących.
+
+  \begin{enumerate}
+  \item Na początku życia programu przy pomocy funkcji
+    \texttt{signal} lub \texttt{sigaction} rejestrujemy
+    procedurę obsługi sygnału, która powinna mieć sygnaturę
+    \texttt{void (int)}. Argumentem procedury obsługi jest
+    numer obsługiwanego sygnału. Co robi ta procedura w naszym
+    przypadku nie ma znaczenia: wystarczy pusta funkcja.
+    Większość sygnałów jest przypisana zdarzeniom systemowym,
+    więc program może je dostać z przyczyn niezależnych od nas,
+    ale dwa są pozostawione do zastosowań zdefiniowanych
+    przez użytkownika: \texttt{SIGUSR1} i \texttt{SIGUSR2}.
+    Procedury obsługi sygnałów są \alert{globalne} --
+    dotyczą wszystkich wątków.
+  \item Pobieramy identyfikator wątku (\texttt{pthread\_t})
+    przy pomocy metody \texttt{std::thread::native\_id()}.
+  \item Wysyłamy do sygnał do wątku przy pomocy funkcji
+    \texttt{pthread\_kill}. Jeśli nie wyspecyfikujemy inaczej
+    podczas rejestracji procedury, wykona się ona w kontekście
+    wątku odbierającego sygnał i używając jego stosu. Jeśli
+    wątek wykonuje kod użytkownika, nic specjalnego się nie
+    wydarzy. Jeśli wykonuje funkcję systemową, zostanie ona
+    przerwana, zwróci błąd, a \texttt{errno}
+    zostanie ustawione na \texttt{EINTR} (interrupted system
+    call). Boost.Asio przetłumaczy to na wyjątek.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Sprzątanie niepotrzebnych obiektów \texttt{ClientSession}}
+  W jakim wątku powinny być niszczone obiekty \texttt{ClientSession}?
+  \begin{itemize}
+    \item Nie może to być ani wątek czytający, ani piszący
+      \texttt{ClientSession}, ponieważ niszczenie obiektu
+      \texttt{std::thread}, kiedy przebieg jego funkcji się jescze
+      nie zakończył powoduje wywołanie \texttt{std::terminate}
+      i zakończenie programu.
+    \item Wątki innych \texttt{ClientSession}s mogą nie istnieć
+      (jeśli jest tylko jeden połączony klient).
+    \item Wątek główny może być dowolnie długo zablokowany
+      w \texttt{acceptor::accept}.
+  \end{itemize}
+
+  Potrzebujemy jeszcze jednego wątku!
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::removeClient}}
+  \begin{lstlisting}
+    class ClientSession {
+    public:
+      void waitToFinish();
+    };
+
+    void ClientSession::waitToFinish() {
+      int state = _state.load();
+      assert(state & READER_TERMINATED);
+      assert(state & WRITER_TERMINATED);
+
+      _readerThread.join();
+      _writerThread.join();
+    }
+
+    class ChatServer {
+    private:
+      std::mutex _clientsToRemoveMutex;
+      std::deque<std::shared_ptr<ClientSession> > _clientsToRemove;
+      std::condition_variable _reaperCondition;
+    };
+
+    void ChatServer::removeClient(std::shared_ptr<ClientSession>&& client) {
+      std::lock_guard<std::mutex> guard(_clientsToRemoveMutex);
+      _clientsToRemove.push_back(std::move(client));
+      _reaperCondition.notify_one();
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{std::thread::join} i \texttt{std::atomic<T>::load}}
+  Metoda \texttt{thread::join} czeka, aż funkcja wątku się zakończy.
+
+  Metoda \texttt{atomic<T>::load} explicite ładuje aktualną wartość
+  zmiennej atomowej z pamięci (przeprowadza synchronizację).
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::reaperThread}}
+  \begin{lstlisting}
+    class ChatServer {
+    private:
+      void reaperThread();
+      std::shared_ptr<ClientSession> getClientToRemove();
+
+      std::thread _reaperThread;
+      std::atomic<bool> _isTerminating;
+    };
+
+
+    void ChatServer::reaperThread() {
+      try {
+        while (true) {
+          std::shared_ptr<ClientSession> client = getClientToRemove();
+          client->waitToFinish();
+          {
+            std::lock_guard<std::mutex> guard(_namesToClientsMutex);
+            _namesToClients.erase(client->getName());
+          }
+          {
+            std::lock_guard<std::mutex> guard(_clientsMutex);
+            size_t res = _clients.erase(client);
+            assert(res == 1);
+            if (_isTerminating && _clients.empty()) {
+              break;
+            }
+          }
+        }
+      }
+      catch (std::exception& ex) {
+        std::cout << "Reaper thread exception: " << ex.what() << std::endl;
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::reaperThread} cd}
+  \begin{lstlisting}
+    std::shared_ptr<ClientSession> ChatServer::getClientToRemove() {
+      std::unique_lock<std::mutex> lock(_clientsToRemoveMutex);
+      _reaperCondition.wait(lock, [this]() { return ! _clientsToRemove.empty(); });
+      std::shared_ptr<ClientSession> client = _clientsToRemove.front();
+      _clientsToRemove.pop_front();
+      return client;
+    }
+
+    ChatServer::ChatServer(int port) :
+      _reaperThread(std::bind(&ChatServer::reaperThread, this)),
+      _isTerminating(false) { }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::shutdown}}
+  \begin{lstlisting}
+    void ChatServer::shutdown() {
+      std::unique_lock<std::mutex> lock(_clientsMutex);
+      for (const auto& client : _clients) {
+        client->terminate();
+      }
+      _isTerminating = true;
+      lock.unlock();
+      pthread_kill(_acceptingThreadId, SIGUSR1);
+    }
+
+    ChatServer::~ChatServer() {
+      _reaperThread.join();
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{Serwer synchroniczny wielowątkowy -- podsumowanie}
+  Zalety:
+  \begin{itemize}
+    \item ,,Prosty'' przepływ sterowania.
+    \item Niewielki narzut kodu na obsługę błędów dzięki wyjątkom.
+    \item Program automatycznie korzysta z wielu rdzeni.
+  \end{itemize}
+
+  Wady:
+  \begin{itemize}
+    \item Skomplikowana procedura zamykania (,,zwijanie'' drzewa
+      wątków).
+    \item Duża możliwość popełnienia subtelnych błędów związanych
+      ze współbieżnością.
+    \item Kiepska wydajność i skalowalność.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Subtelne błędy}
+  Jest tak:
+  \begin{lstlisting}
+    void ChatServer::run() {
+      _acceptingThreadId = pthread_self();
+      while (! _isTerminating) {
+        std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+        _acceptor.accept(client->socket());
+        std::lock_guard<std::mutex> guard(_clientsMutex);
+        if (! _isTerminating) {
+          auto p = _clients.insert(client);
+          assert(p.second);
+          client->start();
+        }
+      }
+    }
+  \end{lstlisting}
+
+  Dlaczego nie tak?
+  \begin{lstlisting}
+    void ChatServer::run() {
+      _acceptingThreadId = pthread_self();
+      while (! _isTerminating) {
+        std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+        _acceptor.accept(client->socket());
+        if (! _isTerminating) {
+          std::lock_guard<std::mutex> guard(_clientsMutex);
+          auto p = _clients.insert(client);
+          assert(p.second);
+          client->start();
+        }
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Subtelne błędy cd}
+  Jest tak:
+  \begin{lstlisting}
+    void ChatServer::run() {
+      _acceptingThreadId = pthread_self();
+      while (! _isTerminating) {
+        std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+        _acceptor.accept(client->socket());
+        std::lock_guard<std::mutex> guard(_clientsMutex);
+        if (! _isTerminating) {
+          auto p = _clients.insert(client);
+          assert(p.second);
+          client->start();
+        }
+      }
+    }
+  \end{lstlisting}
+
+  Dlaczego nie tak?
+  \begin{lstlisting}
+    void ChatServer::run() {
+      _acceptingThreadId = pthread_self();
+      while (! _isTerminating) {
+        std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+        _acceptor.accept(client->socket());
+        std::unique_lock<std::mutex> lock(_clientsMutex);
+        if (! _isTerminating) {
+          auto p = _clients.insert(client);
+          assert(p.second);
+          lock.unlock();
+          client->start();
+        }
+      }
+    }
+  \end{lstlisting}
+\end{frame}
+
+\section{Serwer czatu: wersja asynchroniczna z callbackami}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::run}}
+\begin{lstlisting}
+
+class ChatServer {
+private:
+  void startAccept();
+  void onAccept(std::shared_ptr<ClientSession> client,
+                const boost::system::error_code& error);
+};
+
+void ChatServer::run() {
+  startAccept();
+  _ioService.run();
+}
+
+void ChatServer::startAccept() {
+  std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+  _acceptor.async_accept(client->socket(),
+			 std::bind(&ChatServer::onAccept, this, client, _1));
+}
+
+void ChatServer::onAccept(std::shared_ptr<ClientSession> client,
+			  const boost::system::error_code& error) {
+  if (! error) {
+    client->start();
+  }
+  else {
+    std::cout << "Accept error: " << error << std::endl;
+  }
+
+  startAccept();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::ip::tcp::acceptor::async\_accept}}
+Szablonowa metoda \texttt{async\_accept} jako ostatni argument
+bierze wywoływalny obiekt o sygnaturze
+\texttt{void (const boost::system::error\_code\&)}, który zostanie
+zawołany, gdy nadejdzie nowe połączenie lub wystąpi błąd.
+
+Już na tym przykładzie widzimy, że jedna metoda rozbiła się nam
+na trzy i jesteśmy zmuszeni do jawnej obsługi błędów.
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::io\_service::run}}
+Metoda \texttt{run} dostarcza pętlę główną obsługi zdarzeń. Będzie
+się ona kręcić, dopóki będą aktywne jakieś asynchroniczne wywołania
+lub do momentu, w której powiemy jej, żeby przerwała.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::start}}
+\begin{lstlisting}
+class ClientSession : public std::enable_shared_from_this<ClientSession> {
+public:
+  void start();
+  void terminate();
+private:
+  void askForUserName();
+  void readUserName();
+  void handleUserName(const std::string& userName);
+  void startReceivingAndSendingMessages();
+  void messageOutputFinished();
+  void handleInputLine(const std::string& line);
+  bool parseLine(const std::string& line);
+
+  void asyncReadLine(void (ClientSession::*handler)(const std::string& line));
+  template <class Buffer>
+  void asyncWrite(const Buffer& buffer, void (ClientSession::*handler)());
+
+  ChatServer& _server;
+  boost::asio::ip::tcp::socket _socket;
+  std::string _outputBuffer;
+  bool _sendingAllowed;
+};
+
+ClientSession::ClientSession(ChatServer& server, boost::asio::io_service &ioService) :
+  _sendingAllowed(false) { }
+
+void ClientSession::start() {
+  askForUserName();
+}
+
+void ClientSession::askForUserName() {
+  asyncWrite(boost::asio::buffer("What's your name?\n"), &ClientSession::readUserName);
+}
+
+void ClientSession::readUserName() {
+  asyncReadLine(&ClientSession::handleUserName);
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::start} cd}
+\begin{lstlisting}
+void ClientSession::handleUserName(const std::string& userName) {
+  if (_server.setClientName(shared_from_this(), userName)) {
+    _outputBuffer = "Welcome to the chat, " + userName + "!\n";
+    asyncWrite(boost::asio::buffer(_outputBuffer), &ClientSession::startReceivingAndSendingMessages);
+  }
+  else {
+    _outputBuffer = "Name '" + userName + "' is already taken, invent another one.\n";
+    asyncWrite(boost::asio::buffer(_outputBuffer), &ClientSession::askForUserName);
+  }
+}
+
+void ClientSession::startReceivingAndSendingMessages() {
+  _sendingAllowed = true;
+  if (! _messages.empty()) {
+    asyncWrite(boost::asio::buffer(*_messages.front()), &ClientSession::messageOutputFinished);
+  }
+  asyncReadLine(&ClientSession::handleInputLine);
+}
+
+void ClientSession::handleInputLine(const std::string& line) {
+  if (parseLine(line)) {
+    asyncReadLine(&ClientSession::handleInputLine);
+  }
+  else {
+    terminate();
+  }
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Trudności programowania asynchronicznego}
+  \begin{itemize}
+    \item Jedna metoda \texttt{ClientSession::readerThread} została
+      rozbita na 4. Metoda może zainicjować tylko jedną operację
+      asynchroniczną na gniazdku; po zrobieniu tego musi wyjść.
+      W szczególności na jednym gniazdku może być aktywna
+      co najwyżej jedna operacja zapisu i co najwyżej jedna
+      operacja odczytu.
+    \item Komunikaty o powodzeniu lub niepowodzeniu logowania
+      w wersji synchronicznej trzymaliśmy na stosie. W wersji
+      asynchronicznej musimy trzymać je w polu klasy, ponieważ
+      zmienne lokalne nie są zachowywane.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::asyncReadLine}}
+\begin{lstlisting}
+class ClientSession {
+private:
+  void handleReadError(const boost::system::error_code& error);
+  std::string readLineFromClient();
+
+  friend class ReadHandler;
+}
+
+void ClientSession::asyncReadLine(void (ClientSession::*handler)(const std::string&)) {
+  boost::asio::async_read_until(_socket, _inputBuffer, '\n',
+                               ReadHandler(handler, shared_from_this()));
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::asyncReadLine} cd}
+\begin{lstlisting}
+class ReadHandler {
+public:
+  ReadHandler(void (ClientSession::*handler)(const std::string&),
+	      const std::shared_ptr<ClientSession>& client) :
+    _handler(handler),
+    _client(client) { }
+
+  ReadHandler(void (ClientSession::*handler)(const std::string&),
+	      std::shared_ptr<ClientSession>&& client) :
+    _handler(handler),
+    _client(client) { }
+
+  void operator()(const boost::system::error_code& error, size_t) {
+    if (error) {
+      _client->handleReadError(error);
+      return;
+    }
+    std::string line = _client->readLineFromClient();
+    ((*_client).*_handler)(line);
+  }
+
+private:
+  void (ClientSession::*_handler)(const std::string&);
+  std::shared_ptr<ClientSession> _client;
+};
+
+void ClientSession::handleReadError(const boost::system::error_code& error) {
+  std::cout << "Client reading error: " << error.message() << std::endl;
+  terminate();
+}
+
+std::string ClientSession::readLineFromClient() {
+  std::istream stream(&_inputBuffer);
+  std::string line;
+  std::getline(stream, line);
+  return line;
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::async\_read\_until}}
+  \texttt{async\_read\_until} to asynchroniczny odpowiednik funkcji
+  \texttt{read\_until}. Oprócz tych samych argumentów co
+  \texttt{read\_until}, przyjmuje do dodatkowo wywoływalny obiekt
+  o sygnaturze
+  \texttt{void (const boost::system::error\_code\&, size\_t)}.
+  Po zakończeniu operacji obiekt ten jest wołany z kodem błędu
+  i liczbą przeczytanych bajtów, odpowiednio.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::asyncWrite}}
+\begin{lstlisting}
+class ClientSession {
+private:
+  void handleWriteError(const boost::system::error_code& error);
+
+  friend class WriteHandler;
+};
+
+template <class Buffer>
+void ClientSession::asyncWrite(const Buffer& buffer, void (ClientSession::*handler)()) {
+  boost::asio::async_write(_socket, buffer, WriteHandler(handler, shared_from_this()));
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::asyncWrite} cd}
+\begin{lstlisting}
+class WriteHandler {
+public:
+  WriteHandler(void (ClientSession::*handler)(), const std::shared_ptr<ClientSession>& client) :
+    _handler(handler),
+    _client(client) { }
+
+  WriteHandler(void (ClientSession::*handler)(), std::shared_ptr<ClientSession>&& client) :
+    _handler(handler),
+    _client(client) { }
+
+  void operator()(const boost::system::error_code& error, size_t) {
+    if (error) {
+      _client->handleWriteError(error);
+      return;
+    }
+    ((*_client).*_handler)();
+  }
+
+private:
+  void (ClientSession::*_handler)();
+  std::shared_ptr<ClientSession> _client;
+};
+
+void ClientSession::handleWriteError(const boost::system::error_code& error) {
+  std::cout << "Client writing error: " << error.message() << std::endl;
+  terminate();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::async\_write}}
+  \texttt{async\_write} to asynchroniczny odpowiednik funkcji
+  \texttt{write}. Oprócz tych samych argumentów co
+  \texttt{write}, przyjmuje do dodatkowo wywoływalny obiekt
+  o sygnaturze
+  \texttt{void (const boost::system::error\_code\&, size\_t)}.
+  Po zakończeniu operacji obiekt ten jest wołany z kodem błędu
+  i liczbą zapisanych bajtów, odpowiednio.
+\end{frame}
+
+\begin{frame}{\texttt{ClientSession::asyncReadLine} i \texttt{ClientSession::asyncWrite} -- podsumowanie}
+  Dzięki sprytnej implementacji uniknęliśmy manualnej
+  obsługi błędów po każdym asynchronicznym wywołaniu i udało się
+  oddzielić kod obslugujący błędy od kodu obsługującego
+  zwykłą logikę.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::sendMessage} i \texttt{ChatServer::broadcast}}
+\begin{lstlisting}
+void ClientSession::sendMessage(const std::shared_ptr<std::string> &msg) {
+  bool startSending = _messages.empty() && _sendingAllowed;
+  _messages.push_back(msg);
+  if (startSending) {
+    asyncWrite(boost::asio::buffer(*_messages.front()), &ClientSession::messageOutputFinished);
+  }
+}
+
+void ClientSession::messageOutputFinished() {
+  assert(_sendingAllowed);
+  assert(! _messages.empty());
+  _messages.pop_front();
+  if (! _messages.empty()) {
+    asyncWrite(boost::asio::buffer(*_messages.front()), &ClientSession::messageOutputFinished);
+  }
+}
+
+void ChatServer::broadcast(ClientSession& client, const std::shared_ptr<std::string>& msg) {
+  for (const auto& kvPair : _namesToClients) {
+    ClientSession* receiver = kvPair.second.get();
+    if (receiver!= &client) {
+      receiver->sendMessage(msg);
+    }
+  }
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::terminate} i \texttt{ChatServer::removeClient}}
+\begin{lstlisting}
+void ClientSession::terminate() {
+  _socket.cancel();
+  _server.removeClient(*this);
+}
+
+void ChatServer::removeClient(ClientSession& client) {
+  _namesToClients.erase(client.getName());
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::basic\_io\_object::cancel}}
+  Metoda \texttt{cancel} z klasy \texttt{basic\_io\_object},
+  po której dziedziczy \texttt{socket}, usuwa wszystkie
+  zarejestrowane handlery operacji asynchronicznych związane z
+  tym obiektem.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::shutdown()}}
+\begin{lstlisting}
+void ChatServer::shutdown() {
+  _ioService.stop();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::io\_service::stop}}
+  Metoda stop powoduje zakończenie pętli głównej w jej następnym
+  obrocie -- po zakończeniu handlera, który zawołał \texttt{stop},
+  \texttt{run} zakończy się.
+\end{frame}
+
+\begin{frame}{Serwer asynchroniczny z callbackami -- podsumowanie}
+  Zalety:
+  \begin{itemize}
+    \item Brak problemów ze współbieżnością.
+    \item Prosta sekwencja zakończenia programu.
+    \item Duża wydajność.
+  \end{itemize}
+
+  Wady:
+  \begin{itemize}
+    \item ,,Odwrócone'' sterowanie utrudnia implementację
+      skomplikowanych algorytmów dialogu z klientem. Szczególnie
+      niewdzięczne do implementacji są zagnieżdżone pętle.
+    \item Stan programu musi być explicite przechowywany w polach klasy.
+    \item Standardowo używany jest tylko jeden rdzeń. Jest możliwość
+      uruchomienia wielu pętli \texttt{io\_service::run} w wielu
+      wątkach, ale wtedy problemy ze współbieżnością wracają.
+  \end{itemize}
+\end{frame}
+
+\section{Serwer czatu: wersja asynchroniczna z użyciem wątków kooperatywnych}
+
+\begin{frame}{Wątki kooperatywne: definicja}
+%  \begin{block}
+    \alert{Wątki kooperatywne} (green threads) to wątki zrealizowane przestrzeni użytkownika,
+    niezależnie od systemu operacyjnego. Podobnie jak zwykły wątek, wątek kooperatywny
+    posiada swoją kopię stanu procesora i stos. Wątki kooperatywne przełączane są
+    \alert{manualnie}, na własne żądanie. Stan procesora jest wtedy zachowywany, a sterowanie jest
+    oddawane do \alert{schedulera} działającego w przestrzeni użytkownika, który wybiera wątek,
+    który zostanie wznowiony.
+%  \end{block}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ChatServer::run}}
+\begin{lstlisting}
+class ChatServer {
+private:
+   void ChatServer::acceptThread(boost::asio::yield_context yield);
+}
+
+void ChatServer::run() {
+  boost::asio::spawn(_ioService,  std::bind(&ChatServer::acceptThread, this, _1));
+  _ioService.run();
+}
+
+void ChatServer::acceptThread(boost::asio::yield_context yield) {
+  boost::system::error_code ec;
+  while (true) {
+    std::shared_ptr<ClientSession> client = std::make_shared<ClientSession>(*this, _ioService);
+    _acceptor.async_accept(client->socket(), yield[ec]);
+    if (ec) {
+        std::cout << "Accept error: " << ec.message() << std::endl;
+        shutdown();
+    }
+    client->start();
+  }
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::spawn}}
+  Funkcja \texttt{spawn} uruchamia nowy wątek kooperatywny. Pierwszym argumentem jest
+  \texttt{io\_service}, a drugim obiekt wywoływalny o sygnaturze
+  \texttt{void (boost::asio::yield\_context)}.
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::yield\_context}}
+  \texttt{yield\_context}, to klasa wykonująca całą magię: potrafi wstrzymywać i wznawiać
+  nasz wątek.
+
+  \texttt{yield\_context::operator[](boost::system::error\_code\&)} zachowuje
+  stan wątka i zwraca obiekt wywoływalny pasujący do wszystkich operacji asynchronicznych.
+  Ten wywoływalny obiekt po zawołaniu obudzi nasz wątek, a kod błędu przekazany jako argument
+  do \texttt{operator[]} zostanie ustawiony na kod błędu zwrócony przez operację asynchroniczną.
+
+  Naszym schedulerem jest więc \texttt{io\_service}, który przełącza wątki wołając handlery dla
+  zdazeń.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSesion::start}}
+\begin{lstlisting}
+class ClientSession {
+private:
+  void readerThread(boost::asio::yield_context yield);
+  void writerThread(boost::asio::yield_context yield);
+};
+
+void ClientSession::start() {
+  boost::asio::spawn(_ioService, std::bind(&ClientSession::readerThread, shared_from_this(), _1));
+  boost::asio::spawn(_ioService, std::bind(&ClientSession::writerThread, shared_from_this(), _1));
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::readerThread}}
+\begin{lstlisting}
+class ClientSession {
+private:
+  std::string readLineFromClient(boost::asio::yield_context yield);
+  bool parseLine(const std::string& line);
+  template <class Buffer>
+  void asyncWrite(const Buffer& buffer, boost::asio::yield_context yield);
+};
+
+void ClientSession::readerThread(boost::asio::yield_context yield) {
+  try {
+    bool loginSuccessfull = false;
+    while (! loginSuccessfull) {
+      asyncWrite(boost::asio::buffer("What's your name?\n"), yield);
+      std::string name = readLineFromClient(yield);
+      if ((loginSuccessfull = _server.setClientName(shared_from_this(), name))) {
+	std::string response = "Welcome to the chat, " + name + "!\n";
+	asyncWrite(boost::asio::buffer(response), yield);
+      }
+      else {
+	std::string response = "Name '" + name + "' is already taken, invent another one.\n";
+	asyncWrite(boost::asio::buffer(response), yield);
+      }
+    }
+
+    while (parseLine(readLineFromClient(yield)));
+  }
+  catch (std::exception& ex) {
+    std::cout << "Client reader thread exeption: " << ex.what() << std::endl;
+  }
+
+  onReaderShutdown();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::readerThread} cd}
+\begin{lstlisting}
+std::string ClientSession::readLineFromClient(boost::asio::yield_context yield) {
+  boost::system::error_code ec;
+  boost::asio::async_read_until(_socket, _inputBuffer, '\n', yield[ec]);
+  if (ec) {
+    throw boost::system::system_error(ec);
+  }
+  std::istream stream(&_inputBuffer);
+  std::string line;
+  std::getline(stream, line);
+  return line;
+}
+
+template <class Buffer>
+void ClientSession::asyncWrite(const Buffer& buffer, boost::asio::yield_context yield) {
+  boost::system::error_code ec;
+  boost::asio::async_write(_socket, buffer, yield[ec]);
+  if (ec) {
+    throw boost::system::system_error(ec);
+  }
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{ClientSession::readerThread} -- wnioski}
+  \begin{itemize}
+    \item Kod bardzo podobny jak w wersji wielowątkowej. Jedyne, co musimy zmienić, to gdy chcemy
+      w jakieś metodzie wykonać ,,blokującą'' operację, musimy przepropagować do niej
+      \texttt{yield\_context}.
+    \item Wyjątki znów działają.
+    \item Znów możemy mieć bufory na stosie.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::writerThread} i \texttt{ClientSession::sendMessage}}
+\begin{lstlisting}
+class ClientSession {
+private:
+  ConditionVariable _writerCondition;
+};
+
+void ClientSession::writerThread(boost::asio::yield_context yield) {
+  try {
+    boost::system::error_code ec;
+    bool run = true;
+    while (run) {
+      auto msg = getMessage(yield);
+      if (msg) {
+        asyncWrite(boost::asio::buffer(*msg), yield);
+      }
+      else {
+        run = false;
+      }
+    }
+  }
+  catch (std::exception& ex) {
+    std::cout << "Client writer thread exception: " << ex.what() << std::endl;
+  }
+
+  onWriterShutdown();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ClientSession::writerThread} i \texttt{ClientSession::sendMessage} cd}
+\begin{lstlisting}
+std::shared_ptr<std::string> ClientSession::getMessage(boost::asio::yield_context yield) {
+  _writerCondition.wait(yield,
+			[this]() { return _state != ALL_RUNNING || ! _outputData.empty(); });
+  if (_state != ALL_RUNNING) {
+    return std::shared_ptr<std::string>();
+  }
+  else {
+    auto msg = _outputData.front();
+    _outputData.pop_front();
+    return msg;
+  }
+}
+
+void ClientSession::sendMessage(const std::shared_ptr<std::string>& msg) {
+  _outputData.push_back(msg);
+  _writerCondition.notify_one();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Co to jest \texttt{ConditionVariable}?}
+  Jak dotąd kod używający wątków kooperatywnych był bardzo podobny do kodu zwykłego programu
+  wielowątkowego.
+
+  Nie potrzebujemy mutexów, ponieważ nie mamy ,,prawdziwej'' współbieżności (przełączamy wątki na
+  żądanie, kiedy stan pól w klasie jest spójny).
+
+  Potrzebujemy jednak funkcjonalności \texttt{condition\_variable}: możliwości usypiania
+  i wznawiania wątku w zależności od zadanego warunku.
+
+  Musimy napisać to sami!
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja \texttt{ConditionVariable}}
+\begin{lstlisting}
+class ConditionVariable {
+public:
+  ConditionVariable(boost::asio::io_service &ioService);
+
+  template <class Predicate>
+  void wait(boost::asio::yield_context yield, Predicate pred);
+
+  void notify_one();
+  void notify_all();
+private:
+  boost::asio::deadline_timer _timer;
+};
+
+ConditionVariable::ConditionVariable(boost::asio::io_service& ioService) :
+  _timer(ioService) { }
+
+template <class Predicate>
+void ConditionVariable::wait(boost::asio::yield_context yield, Predicate pred) {
+  boost::system::error_code ec;
+  while (! pred()) {
+    _timer.async_wait(yield[ec]);
+    if (ec == boost::asio::error::operation_aborted) {
+      return;
+    }
+    else {
+      throw boost::system::system_error(ec);
+    }
+  }
+}
+\end{lstlisting}
+\end{frame}
+
+
+\begin{frame}[fragile]{Implementacja \texttt{ConditionVariable} cd}
+\begin{lstlisting}
+void ConditionVariable::notify_one() {
+  _timer.cancel_one();
+}
+
+void ConditionVariable::notify_all() {
+  _timer.cancel();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{\texttt{boost::asio::deadline\_timer}}
+  \texttt{boost::asio::deadline\_timer} to klasa implementująca budzik. Przy pomocy metody
+  \texttt{async\_await} można zarejestrować callback, który zostanie wywołany po określonym
+  czasie lub w zadanym momencie czasowym (mniej-więcej).
+
+  \texttt{ConditionVariable} nie nakręca budzika (nie precyzuje, kiedy ma być zawołany callback),
+  więc będzie spać w nieskończoność (callback nigdy nie zostanie wywołany), chyba że zostanie
+  zawołana metoda \texttt{cancel} lub \texttt{cancel\_one}, która powoduje natychmiastowe
+  wywołanie callbacka z błędem \texttt{boost::asio::error::operation\_aborted}.
+
+  Ponieważ naszym callbackiem jest \texttt{yield\_context}, wywołanie go spowoduje przełączenie
+  kontekstu i obudzenie wątku śpiącego wątku, czyli to o co nam chodziło.
+\end{frame}
+
+\begin{frame}[fragile]{Implementacja sprzątania}
+\begin{lstlisting}
+void ClientSession::onReaderShutdown() {
+  int oldState = _state;
+  _state = oldState | READER_TERMINATED;
+  if (oldState & WRITER_TERMINATED) {
+    _server.removeClient(*this);
+  }
+  else {
+    _writerCondition.notify_one();
+  }
+}
+
+void ClientSession::terminate() {
+  _state |= TERMINATE_REQUESTED;
+  _socket.cancel();
+  _writerCondition.notify_all();
+}
+
+void ClientSession::terminate() {
+  _state |= TERMINATE_REQUESTED;
+  _socket.cancel();
+  _writerCondition.notify_all();
+}
+
+void ChatServer::shutdown() {
+  _ioService.stop();
+}
+\end{lstlisting}
+\end{frame}
+
+\begin{frame}{Serwer asynchroniczny z wykorzystaniem wątków kooperatywnych -- podsumowanie}
+  Zalety:
+  \begin{itemize}
+    \item ,,Prosty'' przepływ sterowania, kod podobny do programu wielowątkowego.
+    \item Stan może być przechowywany na stosie.
+    \item Brak problemów ze współbieżnością.
+    \item Prosy sposób wyjścia z programu.
+    \item Niezła wydajność.
+  \end{itemize}
+
+  Wady:
+  \begin{itemize}
+    \item Standardowo używa tylko jednego rdzenia procesora. Można temu zaradzić podobnie
+      jak w przypadku wersji asynchronicznej z użyciem callbacków, poprzez uruchomienie
+      \texttt{io\_service::run} w wielu ,,prawdziwych'' wątkach jednocześnie, ale problemy ze
+      współbeżnością powrócą.
+  \end{itemize}
+\end{frame}
+ 
+\end{document}
