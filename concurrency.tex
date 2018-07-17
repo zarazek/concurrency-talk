@@ -416,7 +416,7 @@
 \begin{frame}{Obsługa błędów}
   Ponieważ sterowanie przepływa ,,wprost'' (stan programu jest odzwierciedlony przez stos), możemy
   sygnalizować błędy za pomocą wyjątków i łapać je w jednym miejscu. Wyjątki nie powinny opuszczać
-  głównej funkcji wątku (spowoduje to wywołanie \texttt{std::terminate()} i zakończenie programu.
+  głównej funkcji wątku (spowodowałoby to wywołanie \texttt{std::terminate()} i zakończenie programu).
 
   Wszystkie operacje blokujące (widzieliśmy już \texttt{boost::asio::accept}
   i \texttt{boost::asio::write}) rzucają wyjątki typu \texttt{boost::system::system\_error},
